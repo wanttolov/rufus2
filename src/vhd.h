@@ -113,4 +113,7 @@ extern char* VhdMountImageAndGetSize(const char* path, uint64_t* disksize);
 extern void VhdUnmountImage(void);
 extern BOOL SaveImage(void);
 extern void OpticalDiscSaveImage(void);
+extern BOOL EnsureOscdimg(void);
+extern void CreateWindowsIso(void);
+extern BOOL BeginCustomWindowsIso(const char* src, const char* dest, const char* label, const char* workdir, int flags, BOOL apply);
 extern DWORD WINAPI IsoSaveImageThread(void* param);

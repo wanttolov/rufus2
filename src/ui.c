@@ -775,6 +775,56 @@ void SetPersistenceSize(void)
 	SetPersistencePos(pos);
 }
 
+/* Show "Save ISO" on the image-option row when a Windows 10/11 image is loaded.
+ * The button stays hidden for every other image, and the dropdown keeps the full row. */
+static void PositionSaveIsoButton(void)
+{
+	HWND hBtn = GetDlgItem(hMainDialog, IDC_SAVE_ISO);
+	HWND hOpt = GetDlgItem(hMainDialog, IDC_IMAGE_OPTION);
+	RECT rc;
+	char caption[128];
+	const char* txt;
+	const char* tip;
+	SIZE sz;
+	int gap, btn_w, opt_w, max_btn;
+	BOOL show;
+
+	if ((hBtn == NULL) || (hOpt == NULL))
+		return;
+	show = (image_path != NULL) && ((image_options & IMOP_WINTOGO) != 0) && IS_WINDOWS_1X(img_report);
+	GetWindowRect(hOpt, &rc);
+	MapWindowPoints(NULL, hMainDialog, (POINT*)&rc, 2);
+	if (!show) {
+		ShowWindow(hBtn, SW_HIDE);
+		SetWindowPos(hOpt, NULL, 0, 0, fw, rc.bottom - rc.top, SWP_NOZORDER | SWP_NOMOVE);
+		return;
+	}
+	txt = lmprintf(MSG_389);
+	if ((txt == NULL) || (strstr(txt, "UNTRANSLATED") != NULL))
+		txt = "Save ISO";
+	static_strcpy(caption, txt);
+	CharUpperBuffU(caption, sizeof(caption));
+	SetWindowTextU(hBtn, caption);
+	sz = GetTextSize(hBtn, caption);
+	gap = (ssw > 4) ? ssw : 6;
+	btn_w = sz.cx + cbw;
+	if (btn_w < bw)
+		btn_w = bw;
+	max_btn = fw - hw - gap;
+	if ((max_btn > 40) && (btn_w > max_btn))
+		btn_w = max_btn;
+	opt_w = fw - btn_w - gap;
+	if (opt_w < hw)
+		opt_w = hw;
+	SetWindowPos(hOpt, NULL, 0, 0, opt_w, rc.bottom - rc.top, SWP_NOZORDER | SWP_NOMOVE);
+	SetWindowPos(hBtn, hOpt, rc.left + opt_w + gap, rc.top, btn_w, rc.bottom - rc.top, 0);
+	ShowWindow(hBtn, SW_SHOW);
+	tip = lmprintf(MSG_390);
+	if ((tip == NULL) || (strstr(tip, "UNTRANSLATED") != NULL))
+		tip = "Create a bootable ISO from this Windows image, including the setup options you choose.";
+	CreateTooltip(hBtn, tip, 30000);
+}
+
 // Toggle the Image Option dropdown (Windows To Go or persistence settings)
 void ToggleImageOptions(void)
 {
@@ -835,6 +885,7 @@ void ToggleImageOptions(void)
 			(image_options & image_option_toggle_ids[i][1]) ? SW_SHOW : SW_HIDE);
 	}
 	// If you don't force a redraw here, all kind of bad UI artifacts happen...
+	PositionSaveIsoButton();
 	InvalidateRect(hMainDialog, NULL, TRUE);
 }
 

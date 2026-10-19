@@ -649,20 +649,9 @@ BOOL SaveImage(void)
 		img_save.Type = VIRTUAL_STORAGE_TYPE_DEVICE_FFU;
 		break;
 	case image_type_iso:
-		// ISO requires oscdimg.exe. If not already present, attempt to download it.
-		static_sprintf(path, "%s\\%s\\oscdimg_%s.exe", app_data_dir, FILES_DIR, APPLICATION_ARCH);
-		if (!PathFileExistsU(path)) {
-			if (Notification(MB_YESNO | MB_ICONWARNING, lmprintf(MSG_115), lmprintf(MSG_337, "oscdimg.exe")) != IDYES) {
-				ErrorStatus = RUFUS_ERROR(ERROR_CANCELLED);
-				goto out;
-			}
-			IGNORE_RETVAL(_chdirU(app_data_dir));
-			IGNORE_RETVAL(_mkdir(FILES_DIR));
-			if (DownloadToFileOrBufferEx(OSCDIMG_URL, path, SYMBOL_SERVER_USER_AGENT, NULL, hMainDialog, FALSE) < 64 * KB) {
-				ErrorStatus = GetLastError();
-				goto out;
-			}
-		}
+		// ISO images are mastered with oscdimg.exe. Download it once, then reuse it.
+		if (!EnsureOscdimg())
+			goto out;
 		img_save.Type = VIRTUAL_STORAGE_TYPE_DEVICE_ISO;
 		break;
 	default:

@@ -4,14 +4,16 @@ Rufus: The Reliable USB Formatting Utility
 [![VS2022 Build Status](https://img.shields.io/github/actions/workflow/status/pbatard/rufus/vs2026.yml?branch=master&style=flat-square&label=VS2026%20Build)](https://github.com/pbatard/rufus/actions/workflows/vs2026.yml)
 [![MinGW Build Status](https://img.shields.io/github/actions/workflow/status/pbatard/rufus/mingw.yml?branch=master&style=flat-square&label=MinGW%20Build)](https://github.com/pbatard/rufus/actions/workflows/mingw.yml)
 [![Coverity Scan Status](https://img.shields.io/coverity/scan/2172.svg?style=flat-square&label=Coverity%20Analysis)](https://scan.coverity.com/projects/pbatard-rufus)  
-[![Latest Release](https://img.shields.io/github/release-pre/pbatard/rufus.svg?style=flat-square&label=Latest%20Release)](https://github.com/pbatard/rufus/releases)
+[![Latest Release](https://img.shields.io/github/v/release/wanttolov/rufus2?style=flat-square&label=Latest%20Release)](https://github.com/wanttolov/rufus2/releases)
 [![Licence](https://img.shields.io/badge/license-GPLv3-blue.svg?style=flat-square&label=License)](https://www.gnu.org/licenses/gpl-3.0.en.html)
-[![Download Stats](https://img.shields.io/github/downloads/pbatard/rufus/total.svg?label=Downloads&style=flat-square)](https://github.com/pbatard/rufus/releases)
+[![Download Stats](https://img.shields.io/github/downloads/wanttolov/rufus2/total.svg?label=Downloads&style=flat-square)](https://github.com/wanttolov/rufus2/releases)
 [![Contributors](https://img.shields.io/github/contributors/pbatard/rufus.svg?style=flat-square&label=Contributors)](https://github.com/pbatard/rufus/graphs/contributors)
 
 ![Rufus logo](https://raw.githubusercontent.com/pbatard/rufus/master/res/icons/rufus-128.png)
 
 Rufus is a utility that helps format and create bootable USB flash drives.
+
+This fork adds **Save ISO**. From a selected Windows image it writes a new BIOS and UEFI bootable installation ISO that includes the Windows User Experience options (bypass TPM and Secure Boot, skip the online Microsoft account, local account, and the other setup choices). No USB drive is required: use the **Save ISO** button on the image-option row, or the same entry in the SELECT menu.
 
 Features
 --------
@@ -24,6 +26,8 @@ Features
 * Create Windows 11 installation drives for PCs that don't have TPM or Secure Boot
 * Create [Windows To Go](https://en.wikipedia.org/wiki/Windows_To_Go) drives
 * Create VHD/DD, VHDX and FFU images of an existing drive
+* Create a standard BIOS and UEFI bootable Windows installation ISO from a Windows setup folder
+* Save the selected Windows image as a bootable ISO that includes the Windows User Experience options (bypass TPM, skip the online account, and the other setup choices)
 * Create persistent Linux partitions
 * Compute MD5, SHA-1, SHA-256 and SHA-512 checksums of the selected image
 * Perform runtime validation of UEFI bootable media

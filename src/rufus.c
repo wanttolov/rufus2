@@ -874,6 +874,9 @@ void EnableControls(BOOL enable, BOOL remove_checkboxes)
 
 	// Hash button is enabled if an image has been selected
 	EnableWindow(hHashToolbar, enable && (boot_type == BT_IMAGE) && (image_path != NULL));
+	/* Save ISO does not need a USB stick. It only needs the Windows image. */
+	EnableWindow(GetDlgItem(hMainDialog, IDC_SAVE_ISO),
+		enable && (image_path != NULL) && IS_WINDOWS_1X(img_report));
 
 	// Toggle CLOSE/CANCEL
 	SetDlgItemTextU(hMainDialog, IDCANCEL, enable ? uppercase_close : uppercase_cancel);
@@ -1487,6 +1490,269 @@ out:
 	ExitThread(0);
 }
 
+static const char* MsgOrEnglish(uint32_t id, const char* english)
+{
+	const char* s = lmprintf(id);
+	if ((s == NULL) || (strstr(s, "UNTRANSLATED") != NULL))
+		return english;
+	return s;
+}
+
+static void DiscardUnattend(void)
+{
+	if (unattend_xml_path != NULL) {
+		DeleteFileU(unattend_xml_path);
+		unattend_xml_path = NULL;
+	}
+}
+
+/* Returns 1 when an answer file was created, 0 when there is nothing to apply,
+ * and -1 when the user cancels the Windows User Experience dialog. */
+static int PromptWindowsUserExperience(void)
+{
+	int i, arch;
+	uint16_t map[16] = { 0 }, b = 1;
+	selection_dialog_options_t selection = { 0 };
+
+	if (img_report.has_panther_unattend) {
+		uprintf("NOTICE: A '/sources/$OEM$/$$/Panther/unattend.xml' was detected on the ISO.");
+		uprintf("As a result, the 'Windows User Experience dialog' will not be displayed.");
+		return 0;
+	}
+	if ((WindowsVersion.Version < WINDOWS_8) || !IS_WINDOWS_1X(img_report))
+		return 0;
+
+	arch = _log2(img_report.has_efi >> 1);
+	StrArrayCreate(&selection.choices, 16);
+	StrArrayCreate(&selection.tooltips, 16);
+	if (IS_WINDOWS_11(img_report)) {
+		StrArrayAdd(&selection.choices, lmprintf(MSG_329), TRUE);
+		StrArrayAdd(&selection.tooltips, lmprintf(MSG_360), TRUE);
+		MAP_BIT(UNATTEND_SECUREBOOT_TPM_MINRAM);
+	}
+	if (img_report.win_version.build >= 22500) {
+		StrArrayAdd(&selection.choices, lmprintf(MSG_330), TRUE);
+		StrArrayAdd(&selection.tooltips, lmprintf(MSG_361), TRUE);
+		MAP_BIT(UNATTEND_NO_ONLINE_ACCOUNT);
+	}
+	StrArrayAdd(&selection.choices, lmprintf(MSG_333), TRUE);
+	StrArrayAdd(&selection.tooltips, lmprintf(MSG_364), TRUE);
+	selection.username_index = _log2(b) + 1;
+	MAP_BIT(UNATTEND_SET_USER);
+	StrArrayAdd(&selection.choices, lmprintf(MSG_334), TRUE);
+	StrArrayAdd(&selection.tooltips, lmprintf(MSG_365), TRUE);
+	selection.regional_index = _log2(b) + 1;
+	MAP_BIT(UNATTEND_DUPLICATE_LOCALE);
+	StrArrayAdd(&selection.choices, lmprintf(MSG_331), TRUE);
+	StrArrayAdd(&selection.tooltips, lmprintf(MSG_362), TRUE);
+	selection.privacy_index = _log2(b) + 1;
+	MAP_BIT(UNATTEND_NO_DATA_COLLECTION);
+	if (IS_WINDOWS_11(img_report)) {
+		StrArrayAdd(&selection.choices, lmprintf(MSG_355), TRUE);
+		StrArrayAdd(&selection.tooltips, lmprintf(MSG_371), TRUE);
+		selection.edition_index = _log2(b) + 1;
+		MAP_BIT(UNATTEND_SILENT_INSTALL);
+		StrArrayAdd(&selection.choices, lmprintf(MSG_335), TRUE);
+		StrArrayAdd(&selection.tooltips, lmprintf(MSG_366), TRUE);
+		MAP_BIT(UNATTEND_DISABLE_BITLOCKER);
+		StrArrayAdd(&selection.choices, lmprintf(MSG_324), TRUE);
+		StrArrayAdd(&selection.tooltips, lmprintf(MSG_370), TRUE);
+		MAP_BIT(UNATTEND_QOL_ENHANCEMENTS);
+		if (img_report.win_version.build >= 26200) {
+			StrArrayAdd(&selection.choices, lmprintf(MSG_350), TRUE);
+			StrArrayAdd(&selection.tooltips, lmprintf(MSG_368), TRUE);
+			MAP_BIT(UNATTEND_USE_MS2023_BOOTLOADERS);
+			StrArrayAdd(&selection.choices, lmprintf(MSG_323), TRUE);
+			StrArrayAdd(&selection.tooltips, lmprintf(MSG_369), TRUE);
+			MAP_BIT(UNATTEND_APPLY_SKUSIPOLICY);
+		}
+	}
+	if (expert_mode) {
+		StrArrayAdd(&selection.choices, lmprintf(MSG_346), TRUE);
+		StrArrayAdd(&selection.tooltips, lmprintf(MSG_367), TRUE);
+		MAP_BIT(UNATTEND_FORCE_S_MODE);
+	}
+	selection.mask = remap16(unattend_xml_mask, map, FALSE);
+	selection.style = BS_AUTOCHECKBOX;
+	i = SelectionDialog(lmprintf(MSG_327), lmprintf(MSG_328), &selection);
+	StrArrayDestroy(&selection.choices);
+	StrArrayDestroy(&selection.tooltips);
+	if (i < 0)
+		return -1;
+	i = remap16(i, map, TRUE);
+	append_silent = (i & UNATTEND_SILENT_INSTALL);
+	DiscardUnattend();
+	unattend_xml_path = CreateUnattendXml(arch, i);
+	unattend_xml_mask &= ~(remap16(UNATTEND_FULL_MASK, map, TRUE));
+	unattend_xml_mask |= i;
+	WriteSetting32(SETTING_WUE_OPTIONS, (UNATTEND_DEFAULT_MASK << 16) | unattend_xml_mask);
+	return (unattend_xml_path != NULL) ? 1 : 0;
+}
+
+static uint64_t FreeBytesOnPath(const char* path)
+{
+	wchar_t* wpath = utf8_to_wchar(path);
+	wchar_t root[MAX_PATH];
+	ULARGE_INTEGER free_bytes = { 0 };
+
+	if (wpath == NULL)
+		return 0;
+	if (!GetVolumePathNameW(wpath, root, MAX_PATH) || !GetDiskFreeSpaceExW(root, &free_bytes, NULL, NULL))
+		free_bytes.QuadPart = 0;
+	free(wpath);
+	return free_bytes.QuadPart;
+}
+
+static BOOL SameVolume(const char* a, const char* b)
+{
+	wchar_t* wa = utf8_to_wchar(a);
+	wchar_t* wb = utf8_to_wchar(b);
+	wchar_t ra[MAX_PATH], rb[MAX_PATH];
+	BOOL same = FALSE;
+
+	if ((wa != NULL) && (wb != NULL) &&
+		GetVolumePathNameW(wa, ra, MAX_PATH) && GetVolumePathNameW(wb, rb, MAX_PATH))
+		same = (_wcsicmp(ra, rb) == 0);
+	free(wa);
+	free(wb);
+	return same;
+}
+
+/* Pick a directory that has room for one full copy of the installation. */
+static BOOL PickIsoWorkDir(const char* dest, uint64_t bytes, char* parent, size_t parent_cap)
+{
+	char dest_dir[MAX_PATH];
+	char* slash;
+	uint64_t dest_free, temp_free;
+
+	if ((parent == NULL) || (parent_cap < 4))
+		return FALSE;
+	static_strcpy(dest_dir, dest);
+	slash = strrchr(dest_dir, '\\');
+	if ((slash == NULL) || (slash[1] == '\0'))
+		return FALSE;
+	*slash = '\0';
+	if ((dest_dir[1] == ':') && (dest_dir[2] == '\0')) {
+		dest_dir[2] = '\\';
+		dest_dir[3] = '\0';
+	}
+	dest_free = FreeBytesOnPath(dest_dir);
+	temp_free = FreeBytesOnPath(temp_dir);
+	if (SameVolume(dest_dir, temp_dir)) {
+		if (dest_free < bytes * 2)
+			return FALSE;
+		_snprintf_s(parent, parent_cap, _TRUNCATE, "%s", dest_dir);
+		return (parent[0] != '\0');
+	}
+	if ((dest_free < bytes) || (temp_free < bytes))
+		return FALSE;
+	_snprintf_s(parent, parent_cap, _TRUNCATE, "%s", temp_dir);
+	return (parent[0] != '\0');
+}
+
+/* Build a bootable ISO from the Windows image already selected in the UI,
+ * after the same Windows User Experience dialog used by START. */
+static void StartCustomWindowsIso(void)
+{
+	char filename[MAX_PATH] = "Windows_rufus.iso";
+	char title[256], body[2048], label[128], workdir[MAX_PATH];
+	char* dest = NULL;
+	const char* base;
+	const char* slash;
+	const char* dot;
+	uint64_t need;
+	int wue;
+	BOOL apply;
+
+	if (op_in_progress || (format_thread != NULL))
+		return;
+	if ((image_path == NULL) || !IS_WINDOWS_1X(img_report) || !img_report.is_iso) {
+		static_strcpy(title, MsgOrEnglish(MSG_385, "Save Windows ISO with setup options"));
+		static_strcpy(body, MsgOrEnglish(MSG_391,
+			"Select a Windows installation ISO first.\n\n"
+			"Save ISO then asks for the setup options, such as bypassing TPM or skipping the online account, "
+			"and writes a new bootable ISO."));
+		Notification(MB_OK | MB_ICONINFORMATION, title, "%s", body);
+		return;
+	}
+
+	wue = PromptWindowsUserExperience();
+	if (wue < 0) {
+		DiscardUnattend();
+		return;
+	}
+	apply = (unattend_xml_path != NULL);
+	if (!apply && !img_report.has_panther_unattend) {
+		static_strcpy(title, MsgOrEnglish(MSG_385, "Save Windows ISO with setup options"));
+		static_strcpy(body, MsgOrEnglish(MSG_392,
+			"No setup option was selected.\n\nCreate a bootable ISO without those changes?"));
+		if (Notification(MB_YESNO | MB_ICONQUESTION, title, "%s", body) != IDYES)
+			return;
+	}
+
+	base = image_path;
+	slash = strrchr(image_path, '\\');
+	if ((slash != NULL) && (slash[1] != '\0'))
+		base = slash + 1;
+	dot = strrchr(base, '.');
+	if ((dot != NULL) && (dot > base))
+		_snprintf_s(filename, sizeof(filename), _TRUNCATE, "%.*s_rufus.iso", (int)(dot - base), base);
+	else
+		_snprintf_s(filename, sizeof(filename), _TRUNCATE, "%s_rufus.iso", base);
+	/* lmprintf() rotates a small buffer pool. Build the filter here, after the
+	 * Windows User Experience dialog, so MSG_036 is still valid inside FileDialog. */
+	{
+		EXT_DECL(img_ext, filename, __VA_GROUP__("*.iso"), __VA_GROUP__(lmprintf(MSG_036)));
+		dest = FileDialog(TRUE, NULL, &img_ext, NULL);
+	}
+	if (dest == NULL) {
+		DiscardUnattend();
+		return;
+	}
+	if (_stricmp(dest, image_path) == 0) {
+		static_strcpy(title, MsgOrEnglish(MSG_385, "Save Windows ISO with setup options"));
+		static_strcpy(body, MsgOrEnglish(MSG_388,
+			"The ISO file cannot be saved inside the Windows source folder, because it would be packed into itself.\n\n"
+			"Choose a destination outside that folder."));
+		Notification(MB_OK | MB_ICONERROR, title, "%s", body);
+		safe_free(dest);
+		DiscardUnattend();
+		return;
+	}
+
+	need = img_report.projected_size;
+	if (need < img_report.image_size)
+		need = img_report.image_size;
+	need += 2ULL * 1024 * 1024 * 1024;
+	if (!PickIsoWorkDir(dest, need, workdir, sizeof(workdir))) {
+		static_strcpy(title, MsgOrEnglish(MSG_385, "Save Windows ISO with setup options"));
+		static_strcpy(body, MsgOrEnglish(MSG_393,
+			"Not enough free space to build the ISO.\n\n"
+			"The disk needs room for a full copy of the installation files and for the new ISO file."));
+		Notification(MB_OK | MB_ICONERROR, title, "%s", body);
+		uprintf("Not enough free space for a customized Windows ISO (need %s free for the copy)",
+			SizeToHumanReadable(need, FALSE, FALSE));
+		safe_free(dest);
+		DiscardUnattend();
+		return;
+	}
+	if (!EnsureOscdimg()) {
+		if (SCODE_CODE(ErrorStatus) == ERROR_CANCELLED)
+			ErrorStatus = 0;
+		safe_free(dest);
+		DiscardUnattend();
+		return;
+	}
+
+	GetWindowTextU(hLabel, label, sizeof(label));
+	if (!BeginCustomWindowsIso(image_path, dest, label, workdir, unattend_xml_flags, apply)) {
+		safe_free(dest);
+		DiscardUnattend();
+		return;
+	}
+	safe_free(dest);
+}
+
 // Likewise, boot check will block message processing => use a thread
 static DWORD WINAPI BootCheckThread(LPVOID param)
 {
@@ -1691,76 +1957,8 @@ static DWORD WINAPI BootCheckThread(LPVOID param)
 			goto out;
 		}
 		if ((WindowsVersion.Version >= WINDOWS_8) && IS_WINDOWS_1X(img_report) && (!is_windows_to_go)) {
-			if (img_report.has_panther_unattend) {
-				uprintf("NOTICE: A '/sources/$OEM$/$$/Panther/unattend.xml' was detected on the ISO.");
-				uprintf("As a result, the 'Windows User Experience dialog' will not be displayed.");
-			} else {
-				int arch = _log2(img_report.has_efi >> 1);
-				uint16_t map[16] = { 0 }, b = 1;
-				StrArrayCreate(&selection.choices, 16);
-				StrArrayCreate(&selection.tooltips, 16);
-				if (IS_WINDOWS_11(img_report)) {
-					StrArrayAdd(&selection.choices, lmprintf(MSG_329), TRUE);
-					StrArrayAdd(&selection.tooltips, lmprintf(MSG_360), TRUE);
-					MAP_BIT(UNATTEND_SECUREBOOT_TPM_MINRAM);
-				}
-				if (img_report.win_version.build >= 22500) {
-					StrArrayAdd(&selection.choices, lmprintf(MSG_330), TRUE);
-					StrArrayAdd(&selection.tooltips, lmprintf(MSG_361), TRUE);
-					MAP_BIT(UNATTEND_NO_ONLINE_ACCOUNT);
-				}
-				StrArrayAdd(&selection.choices, lmprintf(MSG_333), TRUE);
-				StrArrayAdd(&selection.tooltips, lmprintf(MSG_364), TRUE);
-				selection.username_index = _log2(b) + 1;
-				MAP_BIT(UNATTEND_SET_USER);
-				StrArrayAdd(&selection.choices, lmprintf(MSG_334), TRUE);
-				StrArrayAdd(&selection.tooltips, lmprintf(MSG_365), TRUE);
-				selection.regional_index = _log2(b) + 1;
-				MAP_BIT(UNATTEND_DUPLICATE_LOCALE);
-				StrArrayAdd(&selection.choices, lmprintf(MSG_331), TRUE);
-				StrArrayAdd(&selection.tooltips, lmprintf(MSG_362), TRUE);
-				selection.privacy_index = _log2(b) + 1;
-				MAP_BIT(UNATTEND_NO_DATA_COLLECTION);
-				if (IS_WINDOWS_11(img_report)) {
-					StrArrayAdd(&selection.choices, lmprintf(MSG_355), TRUE);
-					StrArrayAdd(&selection.tooltips, lmprintf(MSG_371), TRUE);
-					selection.edition_index = _log2(b) + 1;
-					MAP_BIT(UNATTEND_SILENT_INSTALL);
-					StrArrayAdd(&selection.choices, lmprintf(MSG_335), TRUE);
-					StrArrayAdd(&selection.tooltips, lmprintf(MSG_366), TRUE);
-					MAP_BIT(UNATTEND_DISABLE_BITLOCKER);
-					StrArrayAdd(&selection.choices, lmprintf(MSG_324), TRUE);
-					StrArrayAdd(&selection.tooltips, lmprintf(MSG_370), TRUE);
-					MAP_BIT(UNATTEND_QOL_ENHANCEMENTS);
-					if (img_report.win_version.build >= 26200) {
-						StrArrayAdd(&selection.choices, lmprintf(MSG_350), TRUE);
-						StrArrayAdd(&selection.tooltips, lmprintf(MSG_368), TRUE);
-						MAP_BIT(UNATTEND_USE_MS2023_BOOTLOADERS);
-						StrArrayAdd(&selection.choices, lmprintf(MSG_323), TRUE);
-						StrArrayAdd(&selection.tooltips, lmprintf(MSG_369), TRUE);
-						MAP_BIT(UNATTEND_APPLY_SKUSIPOLICY);
-					}
-				}
-				if (expert_mode) {
-					StrArrayAdd(&selection.choices, lmprintf(MSG_346), TRUE);
-					StrArrayAdd(&selection.tooltips, lmprintf(MSG_367), TRUE);
-					MAP_BIT(UNATTEND_FORCE_S_MODE);
-				}
-				selection.mask = remap16(unattend_xml_mask, map, FALSE);
-				selection.style = BS_AUTOCHECKBOX;
-				i = SelectionDialog(lmprintf(MSG_327), lmprintf(MSG_328), &selection);
-				StrArrayDestroy(&selection.choices);
-				StrArrayDestroy(&selection.tooltips);
-				if (i < 0)
-					goto out;
-				i = remap16(i, map, TRUE);
-				append_silent = (i & UNATTEND_SILENT_INSTALL);
-				unattend_xml_path = CreateUnattendXml(arch, i);
-				// Remember the user preferences for the current session.
-				unattend_xml_mask &= ~(remap16(UNATTEND_FULL_MASK, map, TRUE));
-				unattend_xml_mask |= i;
-				WriteSetting32(SETTING_WUE_OPTIONS, (UNATTEND_DEFAULT_MASK << 16) | unattend_xml_mask);
-			}
+			if (PromptWindowsUserExperience() < 0)
+				goto out;
 		}
 
 		if ((img_report.projected_size < MAX_ISO_TO_ESP_SIZE) && HAS_REGULAR_EFI(img_report) &&
@@ -2748,6 +2946,11 @@ static INT_PTR CALLBACK MainCallback(HWND hDlg, UINT message, WPARAM wParam, LPA
 				}
 			}
 			break;
+		case IDC_SAVE_ISO:
+		case IDM_CREATE_WIN_ISO:
+			if (format_thread == NULL)
+				StartCustomWindowsIso();
+			break;
 		case IDM_SELECT:
 		case IDM_DOWNLOAD:
 			select_index = LOWORD(wParam) - IDM_SELECT;
@@ -2993,6 +3196,15 @@ static INT_PTR CALLBACK MainCallback(HWND hDlg, UINT message, WPARAM wParam, LPA
 			hMenu = CreatePopupMenu();
 			InsertMenuU(hMenu, -1, MF_BYPOSITION | ((select_index == 0) ? MF_CHECKED : 0), IDM_SELECT, uppercase_select[0]);
 			InsertMenuU(hMenu, -1, MF_BYPOSITION | ((select_index == 1) ? MF_CHECKED : 0), IDM_DOWNLOAD, uppercase_select[1]);
+			{
+				char iso_menu[160];
+				const char* iso_txt = lmprintf(MSG_385);
+				if ((iso_txt == NULL) || (strstr(iso_txt, "UNTRANSLATED") != NULL))
+					iso_txt = "Save Windows ISO with setup options";
+				static_strcpy(iso_menu, iso_txt);
+				CharUpperBuffU(iso_menu, sizeof(iso_menu));
+				InsertMenuU(hMenu, -1, MF_BYPOSITION, IDM_CREATE_WIN_ISO, iso_menu);
+			}
 			TrackPopupMenuEx(hMenu, TPM_LEFTALIGN | TPM_TOPALIGN, Point.x, Point.y, hMainDialog, NULL);
 			DestroyMenu(hMenu);
 			break;

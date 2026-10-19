@@ -89,6 +89,7 @@
 #define IDR_DBX_LOONGARCH64             707
 #define IDM_SELECT                      901
 #define IDM_DOWNLOAD                    902
+#define IDM_CREATE_WIN_ISO              903
 #define IDC_DEVICE                      1001
 #define IDC_FILE_SYSTEM                 1002
 #define IDC_START                       1003
@@ -193,6 +194,7 @@
 #define IDC_LIST_ITEM14                 1116
 #define IDC_LIST_ITEM15                 1117
 #define IDC_LIST_ITEMMAX                1118
+#define IDC_SAVE_ISO                    1120
 #define IDS_DEVICE_TXT                  2000
 #define IDS_PARTITION_TYPE_TXT          2001
 #define IDS_FILE_SYSTEM_TXT             2002

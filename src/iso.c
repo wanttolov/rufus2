@@ -52,6 +52,7 @@
 #include "msapi_utf8.h"
 #include "localization.h"
 #include "bled/bled.h"
+#include "wue.h"
 
 // How often should we update the progress bar, as updating the
 // progress bar too frequently will bring extraction to a crawl
@@ -90,6 +91,7 @@ uint64_t total_blocks, extra_blocks, nb_blocks, last_nb_blocks;
 extern uint64_t md5sum_totalbytes;
 extern BOOL preserve_timestamps, enable_ntfs_compression, validate_md5sum;
 extern HANDLE format_thread;
+extern BOOL save_image;
 extern StrArray modified_files;
 BOOL enable_iso = TRUE, enable_joliet = TRUE, enable_rockridge = TRUE, has_ldlinux_c32;
 #define ISO_BLOCKING(x) do {x; iso_blocking_status++; } while(0)
@@ -2215,48 +2217,311 @@ void OpticalDiscSaveImage(void)
 	}
 }
 
-// Create an ISO image from the currently selected drive, using oscdimg.exe
+/*
+ * Master a Windows installation directory into the same bootable ISO layout that
+ * Microsoft's oscdimg produces, and that the other Windows ISO builders rely on:
+ *   Bootable-Windows-ISO-Creator, Create-WinImage-From-Folder, tiny11builder.
+ *
+ * BIOS boots El Torito platform 0 from \boot\etfsboot.com (no emulation).
+ * UEFI boots El Torito platform EF from \efi\microsoft\boot\efisys.bin.
+ * The filesystem is UDF 1.02 only (-u2 -udfver102). ISO 9660 cannot represent a
+ * Windows install.wim larger than 4 GB without a broken multi-extent file.
+ */
+typedef struct {
+	BOOL bios;
+	BOOL uefi;
+	BOOL payload;
+	char bios_path[MAX_PATH];
+	char uefi_path[MAX_PATH];
+} win_boot_t;
+
+static const char* LocOrEnglish(uint32_t id, const char* english)
+{
+	const char* s = lmprintf(id);
+	if ((s == NULL) || (strstr(s, "UNTRANSLATED") != NULL))
+		return english;
+	return s;
+}
+
+static BOOL AppendText(char* dst, size_t cap, const char* text)
+{
+	size_t used = strlen(dst);
+	size_t add = strlen(text);
+	if (used + add >= cap)
+		return FALSE;
+	memcpy(dst + used, text, add + 1);
+	return TRUE;
+}
+
+static BOOL JoinRel(char* dst, size_t dst_size, const char* root, const char* rel)
+{
+	size_t n = strlen(root);
+	int r;
+	if ((n > 0) && ((root[n - 1] == '\\') || (root[n - 1] == '/')))
+		r = _snprintf_s(dst, dst_size, _TRUNCATE, "%s%s", root, rel);
+	else
+		r = _snprintf_s(dst, dst_size, _TRUNCATE, "%s\\%s", root, rel);
+	return (r >= 0);
+}
+
+static BOOL NonEmptyFile(const char* path)
+{
+	/* _filesizeU() is zero when the file is missing or empty. */
+	return (_filesizeU(path) > 0);
+}
+
+static void ProbeWindowsBoot(const char* root, win_boot_t* boot)
+{
+	char path[MAX_PATH];
+
+	memset(boot, 0, sizeof(*boot));
+	if (JoinRel(path, sizeof(path), root, "boot\\etfsboot.com") && NonEmptyFile(path)) {
+		boot->bios = TRUE;
+		static_strcpy(boot->bios_path, path);
+	}
+	if (JoinRel(path, sizeof(path), root, "efi\\microsoft\\boot\\efisys.bin") && NonEmptyFile(path)) {
+		boot->uefi = TRUE;
+		static_strcpy(boot->uefi_path, path);
+	} else if (JoinRel(path, sizeof(path), root, "efi\\microsoft\\boot\\efisys_noprompt.bin") && NonEmptyFile(path)) {
+		boot->uefi = TRUE;
+		static_strcpy(boot->uefi_path, path);
+		uprintf("Using efisys_noprompt.bin (no 'Press any key' prompt)");
+	}
+	boot->payload =
+		(JoinRel(path, sizeof(path), root, "sources\\install.wim") && NonEmptyFile(path)) ||
+		(JoinRel(path, sizeof(path), root, "sources\\install.esd") && NonEmptyFile(path)) ||
+		(JoinRel(path, sizeof(path), root, "sources\\install.swm") && NonEmptyFile(path));
+}
+
+/* TRUE when 'path' is 'dir' itself or a file/folder inside it. */
+static BOOL PathIsInside(const char* dir, const char* path)
+{
+	size_t n = strlen(dir);
+	char root[MAX_PATH];
+
+	if ((n == 0) || (n >= sizeof(root)) || (strlen(path) < n))
+		return FALSE;
+	static_strcpy(root, dir);
+	while ((n > 0) && ((root[n - 1] == '\\') || (root[n - 1] == '/')))
+		root[--n] = '\0';
+	if ((n == 0) || (_strnicmp(path, root, n) != 0))
+		return FALSE;
+	return (path[n] == '\0') || (path[n] == '\\') || (path[n] == '/');
+}
+
+static BOOL BootPathOk(const char* path)
+{
+	/* '#' separates oscdimg boot entries. '"' would break the command line. */
+	return (strchr(path, '"') == NULL) && (strchr(path, '#') == NULL);
+}
+
+static void FormatBootToken(char* dst, size_t cap, const char* path)
+{
+	if ((strchr(path, ' ') != NULL) || (strchr(path, '\t') != NULL))
+		_snprintf_s(dst, cap, _TRUNCATE, "\"%s\"", path);
+	else
+		_snprintf_s(dst, cap, _TRUNCATE, "%s", path);
+}
+
+static void CopyVolumeLabel(char* dst, size_t cap, const char* src)
+{
+	size_t i, j;
+	if ((src == NULL) || (src[0] == '\0'))
+		src = "WINDOWS";
+	for (i = 0, j = 0; (src[i] != '\0') && (j + 1 < cap) && (j < 32); i++) {
+		unsigned char c = (unsigned char)src[i];
+		if ((c < 0x20) || (strchr("\"\\/:*?<>|", c) != NULL))
+			continue;
+		dst[j++] = (char)c;
+	}
+	dst[j] = '\0';
+	if (j == 0)
+		_snprintf_s(dst, cap, _TRUNCATE, "WINDOWS");
+}
+
+static char* LabelFromFolder(const char* source)
+{
+	const char* base;
+	const char* slash;
+	char* label = (char*)calloc(33, 1);
+	char trimmed[MAX_PATH];
+	char tmp[33];
+	size_t n;
+
+	if (label == NULL)
+		return NULL;
+	n = strlen(source);
+	if (n >= sizeof(trimmed))
+		n = sizeof(trimmed) - 1;
+	memcpy(trimmed, source, n);
+	trimmed[n] = '\0';
+	while ((n > 0) && ((trimmed[n - 1] == '\\') || (trimmed[n - 1] == '/')))
+		trimmed[--n] = '\0';
+	base = trimmed;
+	slash = strrchr(trimmed, '\\');
+	if (slash == NULL)
+		slash = strrchr(trimmed, '/');
+	if ((slash != NULL) && (slash[1] != '\0'))
+		base = slash + 1;
+	/* "E:" carries no useful name. A trailing slash was already removed. */
+	if ((base[0] != '\0') && (base[1] == ':') && (base[2] == '\0'))
+		base = "WINDOWS";
+	CopyVolumeLabel(tmp, sizeof(tmp), base);
+	_snprintf_s(label, 33, _TRUNCATE, "%s", tmp);
+	return label;
+}
+
+static BOOL AppendQuotedPath(char* dst, size_t cap, const char* path)
+{
+	size_t n = strlen(path);
+	BOOL trail = (n > 0) && ((path[n - 1] == '\\') || (path[n - 1] == '/'));
+	BOOL drive_root = (n == 3) && (path[1] == ':') && trail;
+
+	/* "E:\" is parsed as an escaped quote. Leave a drive root unquoted. */
+	if (drive_root)
+		return AppendText(dst, cap, " ") && AppendText(dst, cap, path);
+	if (!AppendText(dst, cap, " \""))
+		return FALSE;
+	if (trail) {
+		char buf[MAX_PATH];
+		if (n >= sizeof(buf))
+			return FALSE;
+		memcpy(buf, path, n - 1);
+		buf[n - 1] = '\0';
+		if (!AppendText(dst, cap, buf))
+			return FALSE;
+	} else if (!AppendText(dst, cap, path)) {
+		return FALSE;
+	}
+	return AppendText(dst, cap, "\"");
+}
+
+static BOOL BuildOscdimgCommand(char* cmd, size_t cap, const char* exe, const char* label,
+	const char* source, const char* dest, const win_boot_t* boot)
+{
+	char lab[33];
+	char piece[64];
+	char bios_tok[MAX_PATH + 4], uefi_tok[MAX_PATH + 4];
+	char boot_arg[MAX_PATH * 2 + 128];
+
+	cmd[0] = '\0';
+	CopyVolumeLabel(lab, sizeof(lab), label);
+	if (!AppendText(cmd, cap, "\"") || !AppendText(cmd, cap, exe) || !AppendText(cmd, cap, "\""))
+		return FALSE;
+	/* -h keeps hidden bootmgr. -u2 is UDF-only so install.wim may exceed 4 GB. */
+	if (!AppendText(cmd, cap, " -g -h -k -m -u2 -udfver102"))
+		return FALSE;
+	if (boot->bios || boot->uefi) {
+		if (!AppendText(cmd, cap, " -o"))
+			return FALSE;
+	}
+	_snprintf_s(piece, sizeof(piece), _TRUNCATE, " -l\"%s\"", lab);
+	if (!AppendText(cmd, cap, piece))
+		return FALSE;
+
+	if (boot->bios || boot->uefi) {
+		if ((boot->bios && !BootPathOk(boot->bios_path)) || (boot->uefi && !BootPathOk(boot->uefi_path))) {
+			uprintf("ERROR: Windows boot path contains '\"' or '#', which oscdimg cannot encode");
+			return FALSE;
+		}
+		if (boot->bios && boot->uefi) {
+			FormatBootToken(bios_tok, sizeof(bios_tok), boot->bios_path);
+			FormatBootToken(uefi_tok, sizeof(uefi_tok), boot->uefi_path);
+			_snprintf_s(boot_arg, sizeof(boot_arg), _TRUNCATE,
+				" -bootdata:2#p0,e,b%s#pEF,e,b%s", bios_tok, uefi_tok);
+			uprintf("Bootable Windows ISO: BIOS (etfsboot.com) + UEFI (efisys)");
+		} else if (boot->uefi) {
+			FormatBootToken(uefi_tok, sizeof(uefi_tok), boot->uefi_path);
+			_snprintf_s(boot_arg, sizeof(boot_arg), _TRUNCATE, " -b%s -pEF", uefi_tok);
+			uprintf("Bootable Windows ISO: UEFI only (boot\\etfsboot.com was not found)");
+		} else {
+			FormatBootToken(bios_tok, sizeof(bios_tok), boot->bios_path);
+			_snprintf_s(boot_arg, sizeof(boot_arg), _TRUNCATE, " -b%s", bios_tok);
+			uprintf("Bootable Windows ISO: BIOS only (efisys.bin was not found)");
+		}
+		if (!AppendText(cmd, cap, boot_arg))
+			return FALSE;
+	} else {
+		uprintf("No El Torito boot image found. The ISO will not boot as Windows setup media.");
+	}
+
+	return AppendQuotedPath(cmd, cap, source) && AppendQuotedPath(cmd, cap, dest);
+}
+
+BOOL EnsureOscdimg(void)
+{
+	char path[MAX_PATH];
+
+	static_sprintf(path, "%s\\%s\\oscdimg_%s.exe", app_data_dir, FILES_DIR, APPLICATION_ARCH);
+	if (PathFileExistsU(path))
+		return TRUE;
+	if (Notification(MB_YESNO | MB_ICONWARNING, lmprintf(MSG_115), lmprintf(MSG_337, "oscdimg.exe")) != IDYES) {
+		ErrorStatus = RUFUS_ERROR(ERROR_CANCELLED);
+		return FALSE;
+	}
+	IGNORE_RETVAL(_chdirU(app_data_dir));
+	IGNORE_RETVAL(_mkdir(FILES_DIR));
+	if (DownloadToFileOrBufferEx(OSCDIMG_URL, path, SYMBOL_SERVER_USER_AGENT, NULL, hMainDialog, FALSE) < 64 * KB) {
+		ErrorStatus = GetLastError();
+		return FALSE;
+	}
+	return TRUE;
+}
+
+/* Create an ISO image with oscdimg.exe. A Windows source gains an El Torito catalog. */
 DWORD WINAPI IsoSaveImageThread(void* param)
 {
 	DWORD r = ERROR_NOT_FOUND;
 	HANDLE exe = INVALID_HANDLE_VALUE;
 	IMG_SAVE* img_save = (IMG_SAVE*)param;
-	char cmd[2 * KB], letters[27], *label;
+	char cmd[4 * KB], exe_path[MAX_PATH], letters[27], *drive_label = NULL;
+	char source[MAX_PATH], label_buf[33];
+	const char* label;
+	win_boot_t boot;
+	BOOL folder_mode = FALSE;
 
-	if (!GetDriveLabel(SelectedDrive.DeviceNumber, letters, &label, TRUE) || letters[0] == '\0')
-		goto out;
+	folder_mode = (img_save->DevicePath != NULL) && (strncmp(img_save->DevicePath, "\\\\.\\", 4) != 0);
+	if (folder_mode) {
+		static_strcpy(source, img_save->DevicePath);
+		label = (img_save->Label != NULL) ? img_save->Label : "WINDOWS";
+	} else {
+		if (!GetDriveLabel(SelectedDrive.DeviceNumber, letters, &drive_label, TRUE) || (letters[0] == '\0'))
+			goto out;
+		static_sprintf(source, "%c:\\", letters[0]);
+		label = drive_label;
+	}
+	CopyVolumeLabel(label_buf, sizeof(label_buf), label);
 
-	// Get a lock and validate that the oscdimg.exe has not been tampered with
-	static_sprintf(cmd, "%s\\%s\\oscdimg_%s.exe", app_data_dir, FILES_DIR, APPLICATION_ARCH);
-	exe = CreateFileU(cmd, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	static_sprintf(exe_path, "%s\\%s\\oscdimg_%s.exe", app_data_dir, FILES_DIR, APPLICATION_ARCH);
+	exe = CreateFileU(exe_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 	if (exe == INVALID_HANDLE_VALUE) {
 		uprintf("ERROR: Could not lock 'oscdimg.exe'");
 		r = GetLastError();
 		goto out;
 	}
-	if (!FileMatchesHash(cmd, OSCDIMG_HASH)) {
+	if (!FileMatchesHash(exe_path, OSCDIMG_HASH)) {
 		uprintf("ERROR: Existing 'oscdimg.exe' hash does not match expected value!");
 		r = ERROR_INVALID_IMAGE_HASH;
 		goto out;
 	}
 
-	// UDF labels cannot be more than 32 characters (and if we have more than 32 chars we are
-	// using the static modifiable char buffer from GetDriveLabel(), so we can alter it).
-	if (strlen(label) > 32)
-		label[32] = '\0';
-
-	// Save to UDF only, as Microsoft's implementation of ISO-9660 doesn't support multiextent
-	// and produces BROKEN images if you try to add files larger than 4 GB.
-	// Plus ISO-9660/Joliet limits labels to 16 characters and has issues with long paths.
-	static_sprintf(cmd, "\"%s\\%s\\oscdimg_%s.exe\" -g -h -k -l\"%s\" -m -u2 -udfver102 %c:\\ \"%s\"",
-		app_data_dir, FILES_DIR, APPLICATION_ARCH, label, letters[0], img_save->ImagePath);
+	ProbeWindowsBoot(source, &boot);
+	if (PathIsInside(source, img_save->ImagePath)) {
+		uprintf("ERROR: ISO destination '%s' is inside the source '%s'", img_save->ImagePath, source);
+		r = ERROR_INVALID_PARAMETER;
+		goto out;
+	}
+	if (!BuildOscdimgCommand(cmd, sizeof(cmd), exe_path, label_buf, source, img_save->ImagePath, &boot)) {
+		r = ERROR_INVALID_NAME;
+		goto out;
+	}
 	uprintf("Running command: '%s'", cmd);
-	// For detecting typical oscdimg commandline progress report of type: "\r15.5% complete"
+	/* oscdimg progress looks like: "\r15.5% complete" */
 	r = RunCommandWithProgress(cmd, sysnative_dir, FALSE, MSG_261, ".*\r([0-9\\.]+)% complete.*");
 
 out:
 	safe_closehandle(exe);
-	if (r != 0 && !IS_ERROR(ErrorStatus)) {
+	if ((r != 0) && !IS_ERROR(ErrorStatus)) {
 		SetLastError(r);
 		uprintf("Failed to write ISO image: %s", WindowsErrorString());
 		ErrorStatus = RUFUS_ERROR(SCODE_CODE(r));
@@ -2266,5 +2531,285 @@ out:
 		uprintf("Saved '%s'", img_save->ImagePath);
 	safe_free(img_save->DevicePath);
 	safe_free(img_save->ImagePath);
+	safe_free(img_save->Label);
 	ExitThread(r);
+}
+
+/*
+ * Build a bootable Windows installation ISO from a folder that already contains
+ * the setup files (an extracted ISO, or the files copied onto a USB stick).
+ */
+void CreateWindowsIso(void)
+{
+	static IMG_SAVE img_save;
+	char filename[128] = "Windows.iso";
+	char title[256], body[1024];
+	char* folder = NULL;
+	char* label = NULL;
+	win_boot_t boot;
+	EXT_DECL(img_ext, filename, __VA_GROUP__("*.iso"), __VA_GROUP__(lmprintf(MSG_036)));
+
+	if (op_in_progress || (format_thread != NULL))
+		return;
+
+	static_strcpy(title, LocOrEnglish(MSG_387, "Select the Windows installation folder"));
+	folder = FolderDialog(title);
+	if (folder == NULL)
+		return;
+	if (strlen(folder) >= MAX_PATH) {
+		uprintf("Windows ISO source path is too long");
+		safe_free(folder);
+		return;
+	}
+
+	ProbeWindowsBoot(folder, &boot);
+	if (!boot.payload || (!boot.bios && !boot.uefi)) {
+		static_strcpy(title, LocOrEnglish(MSG_385, "Create bootable Windows ISO"));
+		static_strcpy(body, LocOrEnglish(MSG_386,
+			"The selected folder is not a Windows installation source.\n\n"
+			"It needs sources\\install.wim, sources\\install.esd or sources\\install.swm, and a boot image "
+			"(boot\\etfsboot.com and/or efi\\microsoft\\boot\\efisys.bin)."));
+		Notification(MB_OK | MB_ICONERROR, title, "%s", body);
+		uprintf("Rejected Windows ISO source '%s' (payload=%d bios=%d uefi=%d)",
+			folder, boot.payload, boot.bios, boot.uefi);
+		safe_free(folder);
+		return;
+	}
+
+	label = LabelFromFolder(folder);
+	if (label == NULL) {
+		safe_free(folder);
+		return;
+	}
+	static_sprintf(filename, "%s.iso", label);
+	memset(&img_save, 0, sizeof(img_save));
+	img_save.Type = VIRTUAL_STORAGE_TYPE_DEVICE_ISO;
+	img_save.ImagePath = FileDialog(TRUE, NULL, &img_ext, NULL);
+	if (img_save.ImagePath == NULL) {
+		safe_free(folder);
+		safe_free(label);
+		return;
+	}
+	if (PathIsInside(folder, img_save.ImagePath)) {
+		static_strcpy(title, LocOrEnglish(MSG_385, "Create bootable Windows ISO"));
+		static_strcpy(body, LocOrEnglish(MSG_388,
+			"The ISO file cannot be saved inside the Windows source folder, because it would be packed into itself.\n\n"
+			"Choose a destination outside that folder."));
+		Notification(MB_OK | MB_ICONERROR, title, "%s", body);
+		safe_free(folder);
+		safe_free(label);
+		safe_free(img_save.ImagePath);
+		return;
+	}
+	if (!EnsureOscdimg()) {
+		safe_free(folder);
+		safe_free(label);
+		safe_free(img_save.ImagePath);
+		return;
+	}
+
+	img_save.DevicePath = folder;
+	img_save.Label = label;
+	folder = NULL;
+	label = NULL;
+	SendMessage(hMainDialog, UM_PROGRESS_INIT, 0, 0);
+	ErrorStatus = 0;
+	EnableControls(FALSE, FALSE);
+	InitProgress(TRUE);
+	format_thread = CreateThread(NULL, 0, IsoSaveImageThread, &img_save, 0, NULL);
+	if (format_thread != NULL) {
+		uprintf("\r\nBootable Windows ISO operation started");
+		PrintInfo(0, -1);
+		SendMessage(hMainDialog, UM_TIMER_START, 0, 0);
+	} else {
+		uprintf("Unable to start Windows ISO thread");
+		ErrorStatus = RUFUS_ERROR(APPERR(ERROR_CANT_START_THREAD));
+		safe_free(img_save.DevicePath);
+		safe_free(img_save.ImagePath);
+		safe_free(img_save.Label);
+		PostMessage(hMainDialog, UM_FORMAT_COMPLETED, (WPARAM)FALSE, 0);
+	}
+}
+
+typedef struct {
+	char* src;
+	char* dest;
+	char* label;
+	char* workdir;
+	int flags;
+	BOOL apply;
+} custom_iso_job_t;
+
+static void FreeCustomIsoJob(custom_iso_job_t* job)
+{
+	if (job == NULL)
+		return;
+	safe_free(job->src);
+	safe_free(job->dest);
+	safe_free(job->label);
+	safe_free(job->workdir);
+	free(job);
+}
+
+/* Map a directory to a free drive letter so ApplyWindowsCustomization() can
+ * patch it the same way it patches a USB volume. */
+static char MapFreeDrive(const char* path)
+{
+	DWORD drives = GetLogicalDrives();
+	wchar_t dev[8];
+	wchar_t* wpath = utf8_to_wchar(path);
+	char letter;
+
+	if (wpath == NULL)
+		return 0;
+	for (letter = 'Z'; letter >= 'D'; letter--) {
+		if (drives & (1u << (letter - 'A')))
+			continue;
+		_snwprintf_s(dev, ARRAYSIZE(dev), _TRUNCATE, L"%c:", letter);
+		if (DefineDosDeviceW(DDD_NO_BROADCAST_SYSTEM, dev, wpath)) {
+			uprintf("Mapped '%s' as drive %c: for Windows setup options", path, letter);
+			free(wpath);
+			return letter;
+		}
+	}
+	free(wpath);
+	return 0;
+}
+
+static void UnmapDrive(char letter)
+{
+	wchar_t dev[8];
+
+	if (letter == 0)
+		return;
+	_snwprintf_s(dev, ARRAYSIZE(dev), _TRUNCATE, L"%c:", letter);
+	if (!DefineDosDeviceW(DDD_REMOVE_DEFINITION | DDD_NO_BROADCAST_SYSTEM, dev, NULL))
+		uprintf("Could not remove temporary drive %c:: %s", letter, WindowsErrorString());
+}
+
+static DWORD WINAPI CustomWindowsIsoThread(void* param)
+{
+	custom_iso_job_t* job = (custom_iso_job_t*)param;
+	char extract[MAX_PATH] = { 0 }, label_buf[33], cmd[4 * KB], exe_path[MAX_PATH];
+	win_boot_t boot;
+	char letter = 0;
+	DWORD r = ERROR_GEN_FAILURE;
+	HANDLE exe = INVALID_HANDLE_VALUE;
+
+	if (GetTempDirNameU(job->workdir, "RUF", 0, extract) == 0) {
+		uprintf("Could not create a work directory in '%s'", job->workdir);
+		r = GetLastError();
+		goto out;
+	}
+	uprintf("Extracting '%s' to '%s'", job->src, extract);
+	if (!ExtractISO(job->src, extract, FALSE)) {
+		uprintf("Could not extract the Windows image");
+		r = IS_ERROR(ErrorStatus) ? (DWORD)SCODE_CODE(ErrorStatus) : ERROR_GEN_FAILURE;
+		goto out;
+	}
+	if (job->apply && (unattend_xml_path != NULL)) {
+		letter = MapFreeDrive(extract);
+		if (letter == 0) {
+			uprintf("Could not assign a drive letter to the extracted Windows files");
+			r = ERROR_NO_SYSTEM_RESOURCES;
+			goto out;
+		}
+		if (!ApplyWindowsCustomization(letter, job->flags)) {
+			uprintf("Could not apply the Windows User Experience options");
+			r = ERROR_GEN_FAILURE;
+			goto out;
+		}
+		UnmapDrive(letter);
+		letter = 0;
+	} else {
+		uprintf("No Windows User Experience answer file to apply. The ISO will still be bootable.");
+	}
+
+	ProbeWindowsBoot(extract, &boot);
+	if (!boot.bios && !boot.uefi) {
+		uprintf("Extracted files have no etfsboot.com or efisys.bin. The ISO would not boot.");
+		r = ERROR_NOT_FOUND;
+		goto out;
+	}
+	if (PathIsInside(extract, job->dest)) {
+		uprintf("ISO destination '%s' is inside the work directory", job->dest);
+		r = ERROR_INVALID_PARAMETER;
+		goto out;
+	}
+	CopyVolumeLabel(label_buf, sizeof(label_buf), job->label);
+	if ((job->flags & UNATTEND_SILENT_INSTALL) && (strlen(label_buf) + strlen(" (SILENT)") <= 32))
+		static_strcat(label_buf, " (SILENT)");
+	static_sprintf(exe_path, "%s\\%s\\oscdimg_%s.exe", app_data_dir, FILES_DIR, APPLICATION_ARCH);
+	exe = CreateFileU(exe_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (exe == INVALID_HANDLE_VALUE) {
+		uprintf("Could not lock 'oscdimg.exe'");
+		r = GetLastError();
+		goto out;
+	}
+	if (!FileMatchesHash(exe_path, OSCDIMG_HASH)) {
+		uprintf("Existing 'oscdimg.exe' hash does not match expected value");
+		r = ERROR_INVALID_IMAGE_HASH;
+		goto out;
+	}
+	if (!BuildOscdimgCommand(cmd, sizeof(cmd), exe_path, label_buf, extract, job->dest, &boot)) {
+		r = ERROR_INVALID_NAME;
+		goto out;
+	}
+	uprintf("Running command: '%s'", cmd);
+	SendMessage(hMainDialog, UM_PROGRESS_INIT, 0, 0);
+	r = RunCommandWithProgress(cmd, sysnative_dir, FALSE, MSG_261, ".*\r([0-9\\.]+)% complete.*");
+
+out:
+	UnmapDrive(letter);
+	safe_closehandle(exe);
+	if (extract[0] != '\0')
+		SHDeleteDirectoryExU(NULL, extract, FOF_NO_UI);
+	if ((r != 0) && !IS_ERROR(ErrorStatus)) {
+		SetLastError(r);
+		uprintf("Failed to create the Windows ISO: %s", WindowsErrorString());
+		ErrorStatus = RUFUS_ERROR(SCODE_CODE(r));
+	}
+	PostMessage(hMainDialog, UM_FORMAT_COMPLETED, (WPARAM)TRUE, 0);
+	if (!IS_ERROR(ErrorStatus))
+		uprintf("Saved customized Windows ISO '%s'", job->dest);
+	FreeCustomIsoJob(job);
+	ExitThread(r);
+}
+
+BOOL BeginCustomWindowsIso(const char* src, const char* dest, const char* label, const char* workdir, int flags, BOOL apply)
+{
+	custom_iso_job_t* job;
+
+	if ((src == NULL) || (dest == NULL) || (workdir == NULL) || (format_thread != NULL))
+		return FALSE;
+	job = (custom_iso_job_t*)calloc(1, sizeof(*job));
+	if (job == NULL)
+		return FALSE;
+	job->src = safe_strdup(src);
+	job->dest = safe_strdup(dest);
+	job->label = safe_strdup((label != NULL && label[0] != '\0') ? label : "WINDOWS");
+	job->workdir = safe_strdup(workdir);
+	job->flags = flags;
+	job->apply = apply;
+	if ((job->src == NULL) || (job->dest == NULL) || (job->label == NULL) || (job->workdir == NULL)) {
+		FreeCustomIsoJob(job);
+		return FALSE;
+	}
+	SendMessage(hMainDialog, UM_PROGRESS_INIT, 0, 0);
+	ErrorStatus = 0;
+	EnableControls(FALSE, FALSE);
+	InitProgress(FALSE);
+	save_image = TRUE;
+	format_thread = CreateThread(NULL, 0, CustomWindowsIsoThread, job, 0, NULL);
+	if (format_thread == NULL) {
+		uprintf("Unable to start the customized Windows ISO thread");
+		ErrorStatus = RUFUS_ERROR(APPERR(ERROR_CANT_START_THREAD));
+		FreeCustomIsoJob(job);
+		PostMessage(hMainDialog, UM_FORMAT_COMPLETED, (WPARAM)FALSE, 0);
+		return FALSE;
+	}
+	uprintf("\r\nCustomized Windows ISO operation started");
+	PrintInfo(0, -1);
+	SendMessage(hMainDialog, UM_TIMER_START, 0, 0);
+	return TRUE;
 }

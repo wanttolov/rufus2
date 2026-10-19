@@ -1,3 +1,8 @@
+o Unreleased
+    Add creation of a standard BIOS+UEFI bootable Windows installation ISO from a setup folder
+    Add "Save ISO" to write the selected Windows image plus the Windows User Experience options (TPM, online account, ...)
+    Make "Save as ISO" bootable when the source drive contains Windows setup boot images (etfsboot.com / efisys.bin)
+
 o Version 4.15 (2026.06.30)
     Add RISC-V 64 support to UEFI:NTFS
     Improve the guards for using the "silent" Windows installation option

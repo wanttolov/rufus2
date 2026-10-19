@@ -235,6 +235,81 @@ out:
 }
 
 /*
+ * Pick an existing folder. Returned UTF-8 path is allocated and must be freed.
+ * Same COM requirement as FileDialog(): the calling thread must be CoInitializeEx()'d.
+ */
+char* FolderDialog(const char* title)
+{
+	char* filepath = NULL;
+	HRESULT hr;
+	IFileDialog* pfd = NULL;
+	IShellItem* psiResult = NULL;
+	IShellItem* si_path = NULL;
+	DWORD opts = 0;
+	wchar_t* wtitle = NULL;
+	wchar_t* wpath = NULL;
+	const GUID download_dir_guid =
+		{ 0x374de290, 0x123f, 0x4565, { 0x91, 0x64, 0x39, 0xc4, 0x92, 0x5e, 0x46, 0x7b } };
+
+	dialog_showing++;
+	hr = CoCreateInstance(&CLSID_FileOpenDialog, NULL, CLSCTX_INPROC,
+		&IID_IFileDialog, (LPVOID)&pfd);
+	if (FAILED(hr) || (pfd == NULL)) {
+		uprintf("CoCreateInstance for folder dialog failed: %s", WindowsErrorString());
+		goto out;
+	}
+
+	if (SUCCEEDED(IFileDialog_GetOptions(pfd, &opts))) {
+		opts |= FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR;
+		opts &= ~(DWORD)FOS_FILEMUSTEXIST;
+		IFileDialog_SetOptions(pfd, opts);
+	}
+	if (title != NULL) {
+		wtitle = utf8_to_wchar(title);
+		if (wtitle != NULL)
+			IFileDialog_SetTitle(pfd, wtitle);
+	}
+
+	hr = SHGetKnownFolderPath(&download_dir_guid, 0, 0, &wpath);
+	if (SUCCEEDED(hr)) {
+		hr = SHCreateItemFromParsingName(wpath, NULL, &IID_IShellItem, (LPVOID)&si_path);
+		if (SUCCEEDED(hr))
+			IFileDialog_SetDefaultFolder(pfd, si_path);
+		CoTaskMemFree(wpath);
+		wpath = NULL;
+	}
+
+	hr = IFileDialog_Show(pfd, hMainDialog);
+	if (SUCCEEDED(hr)) {
+		hr = IFileDialog_GetResult(pfd, &psiResult);
+		if (SUCCEEDED(hr)) {
+			hr = IShellItem_GetDisplayName(psiResult, SIGDN_FILESYSPATH, &wpath);
+			if (SUCCEEDED(hr)) {
+				filepath = wchar_to_utf8(wpath);
+				CoTaskMemFree(wpath);
+				wpath = NULL;
+			} else {
+				SetLastError(hr);
+				uprintf("Unable to access folder path: %s", WindowsErrorString());
+			}
+			IShellItem_Release(psiResult);
+		}
+	} else if (HRESULT_CODE(hr) != ERROR_CANCELLED) {
+		SetLastError(hr);
+		uprintf("Could not show folder dialog: %s", WindowsErrorString());
+	}
+
+out:
+	if (si_path != NULL)
+		IShellItem_Release(si_path);
+	safe_free(wtitle);
+	if (pfd != NULL)
+		IFileDialog_Release(pfd);
+	dialog_showing--;
+	return filepath;
+}
+
+/*
  * Create the application status bar
  */
 void CreateStatusBar(HFONT* hFont)

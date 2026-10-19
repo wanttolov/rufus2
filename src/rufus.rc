@@ -46,6 +46,7 @@ BEGIN
     CONTROL         "SELECT",IDC_SELECT,"Button", WS_TABSTOP,180,52,45,10
     LTEXT           "Image option",IDS_IMAGE_OPTION_TXT,8,65,216,8
     COMBOBOX        IDC_IMAGE_OPTION,8,74,96,30,CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    PUSHBUTTON      "Save ISO",IDC_SAVE_ISO,128,74,96,12,WS_TABSTOP | NOT WS_VISIBLE
     CONTROL         "",IDC_PERSISTENCE_SLIDER,"msctls_trackbar32",TBS_BOTH | TBS_NOTICKS | WS_TABSTOP,125,76,34,8
     EDITTEXT        IDC_PERSISTENCE_SIZE,160,74,36,12,ES_AUTOHSCROLL | ES_NUMBER
     COMBOBOX        IDC_PERSISTENCE_UNITS,200,74,24,30,CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
@@ -430,7 +431,7 @@ BEGIN
             VALUE "FileDescription", "Rufus"
             VALUE "FileVersion", "4.16.2412"
             VALUE "InternalName", "Rufus"
-            VALUE "LegalCopyright", "© 2011-2026 Pete Batard (GPL v3)"
+            VALUE "LegalCopyright", "ï¿½ 2011-2026 Pete Batard (GPL v3)"
             VALUE "LegalTrademarks", "https://www.gnu.org/licenses/gpl-3.0.html"
             VALUE "OriginalFilename", "rufus-4.16.exe"
             VALUE "ProductName", "Rufus"
